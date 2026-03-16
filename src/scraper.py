@@ -1,12 +1,9 @@
 import asyncio
-import importlib
-import inspect
 import json
 import os
 import random
-from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Optional
+from typing import Optional
 from urllib.parse import urlencode
 
 from playwright.async_api import (
@@ -24,11 +21,11 @@ from src.ai_handler import (
 from src.config import (
     AI_DEBUG_MODE,
     API_URL_PATTERN,
-    BROWSER_EXECUTABLE_PATH,
     DETAIL_API_URL_PATTERN,
     LOGIN_IS_EDGE,
     RUN_HEADLESS,
     RUNNING_IN_DOCKER,
+    SKIP_AI_ANALYSIS,
     STATE_FILE,
 )
 from src.parsers import (
@@ -41,14 +38,27 @@ from src.parsers import (
 from src.utils import (
     format_registration_days,
     get_link_unique_key,
+    log_time,
     random_sleep,
     safe_get,
     save_to_jsonl,
-    log_time,
 )
 from src.rotation import RotationPool, load_state_files, parse_proxy_pool, RotationItem
-from src.keyword_rule_engine import build_search_text, evaluate_keyword_rules
 from src.failure_guard import FailureGuard
+from src.services.account_strategy_service import resolve_account_runtime_plan
+from src.infrastructure.persistence.storage_names import build_result_filename
+from src.services.item_analysis_dispatcher import (
+    ItemAnalysisDispatcher,
+    ItemAnalysisJob,
+)
+from src.services.price_history_service import (
+    build_market_reference,
+    load_price_snapshots,
+    record_market_snapshots,
+)
+from src.services.result_storage_service import load_processed_link_keys
+from src.services.seller_profile_cache import SellerProfileCache
+from src.services.search_pagination import advance_search_page
 
 
 class RiskControlError(Exception):
@@ -60,133 +70,7 @@ class LoginRequiredError(Exception):
 
 
 FAILURE_GUARD = FailureGuard()
-
-
-class HookStage:
-    ITEM_DISCOVERED = "item_discovered"
-    BEFORE_SELLER_PROFILE = "before_seller_profile"
-    ITEM_READY_FOR_ANALYSIS = "item_ready_for_analysis"
-    BEFORE_NOTIFICATION = "before_notification"
-    ITEM_COMPLETED = "item_completed"
-
-
-@dataclass
-class HookDecision:
-    proceed: bool = True
-    skip_item: bool = False
-    stop_task: bool = False
-    reason: str = ""
-    updates: dict = field(default_factory=dict)
-
-    @classmethod
-    def continue_next(cls) -> "HookDecision":
-        return cls(proceed=True)
-
-    @classmethod
-    def skip_current_item(cls, reason: str = "") -> "HookDecision":
-        return cls(proceed=False, skip_item=True, reason=reason)
-
-    @classmethod
-    def stop_whole_task(cls, reason: str = "") -> "HookDecision":
-        return cls(proceed=False, stop_task=True, reason=reason)
-
-
-class ScraperHookRegistry:
-    """A tiny stage-based hook pipeline for item-level flow control."""
-
-    def __init__(self):
-        self._hooks: dict[str, list[Callable]] = {}
-
-    def register(self, stage: str, handler: Callable) -> None:
-        if not callable(handler):
-            raise TypeError(f"Hook handler is not callable: {handler}")
-        self._hooks.setdefault(stage, []).append(handler)
-
-    async def run(self, stage: str, context: dict) -> HookDecision:
-        handlers = self._hooks.get(stage, [])
-        for handler in handlers:
-            handler_name = getattr(handler, "__name__", str(handler))
-            log_time(f"[Hook:{stage}] 开始执行 {handler_name}")
-            try:
-                raw_result = handler(context)
-                if inspect.isawaitable(raw_result):
-                    raw_result = await raw_result
-                decision = _normalize_hook_result(raw_result)
-            except Exception as e:
-                log_time(f"[Hook:{stage}] {handler_name} 执行失败: {type(e).__name__} - {e}")
-                raise
-            if decision.updates:
-                context.update(decision.updates)
-            if decision.reason:
-                log_time(
-                    f"[Hook:{stage}] {handler_name} 返回: {decision.reason}"
-                )
-            if decision.stop_task or decision.skip_item or not decision.proceed:
-                return decision
-        return HookDecision.continue_next()
-
-
-def _normalize_hook_result(result) -> HookDecision:
-    if result is None or result is True:
-        return HookDecision.continue_next()
-    if isinstance(result, HookDecision):
-        return result
-    if result is False:
-        return HookDecision.skip_current_item("hook returned False")
-    if isinstance(result, str):
-        return HookDecision.skip_current_item(result)
-    if isinstance(result, dict):
-        return HookDecision(
-            proceed=result.get("proceed", True),
-            skip_item=result.get("skip_item", False),
-            stop_task=result.get("stop_task", False),
-            reason=result.get("reason", ""),
-            updates=result.get("updates", {}) or {},
-        )
-    raise TypeError(
-        f"Unsupported hook result type: {type(result).__name__}. "
-        "Use bool/str/dict/HookDecision."
-    )
-
-
-def _load_hook_callable(path: str) -> Callable:
-    """
-    Support:
-    - module.submodule:function_name
-    - module.submodule.function_name
-    """
-    if ":" in path:
-        module_path, func_name = path.split(":", 1)
-    else:
-        module_path, func_name = path.rsplit(".", 1)
-    module = importlib.import_module(module_path)
-    handler = getattr(module, func_name, None)
-    if not callable(handler):
-        raise ValueError(f"Hook path is not callable: {path}")
-    return handler
-
-
-def _build_hook_registry(task_config: dict) -> ScraperHookRegistry:
-    registry = ScraperHookRegistry()
-    hook_config = task_config.get("hooks") or {}
-    if not isinstance(hook_config, dict):
-        return registry
-
-    for stage, raw_handlers in hook_config.items():
-        handlers = raw_handlers
-        if not isinstance(handlers, (list, tuple)):
-            handlers = [handlers]
-        for handler in handlers:
-            try:
-                if callable(handler):
-                    registry.register(stage, handler)
-                elif isinstance(handler, str) and handler.strip():
-                    registry.register(stage, _load_hook_callable(handler.strip()))
-                else:
-                    print(f"[Hook] 忽略非法 handler: stage={stage}, handler={handler}")
-            except Exception as e:
-                print(f"[Hook] 注册失败: stage={stage}, handler={handler}, err={e}")
-    return registry
+EDGE_DOCKER_WARNING_PRINTED = False
 
 
 def _is_login_url(url: str) -> bool:
@@ -194,6 +78,19 @@ def _is_login_url(url: str) -> bool:
         return False
     lowered = url.lower()
     return "passport.goofish.com" in lowered or "mini_login" in lowered
+
+
+def _resolve_browser_channel() -> str:
+    global EDGE_DOCKER_WARNING_PRINTED
+    if RUNNING_IN_DOCKER:
+        if LOGIN_IS_EDGE and not EDGE_DOCKER_WARNING_PRINTED:
+            print(
+                "检测到 LOGIN_IS_EDGE=true，但 Docker 镜像未内置 Edge，"
+                "任务运行时将改用 Chromium。"
+            )
+            EDGE_DOCKER_WARNING_PRINTED = True
+        return "chromium"
+    return "msedge" if LOGIN_IS_EDGE else "chrome"
 
 
 def _should_analyze_images(task_config: dict) -> bool:
@@ -333,6 +230,18 @@ def _get_rotation_settings(task_config: dict) -> dict:
         "proxy_retry_limit": max(1, proxy_retry_limit),
         "proxy_blacklist_ttl": max(0, proxy_blacklist_ttl),
     }
+
+
+def _get_ai_analysis_concurrency(task_config: dict) -> int:
+    configured = task_config.get("ai_analysis_concurrency")
+    default = _as_int(os.getenv("AI_ANALYSIS_CONCURRENCY"), 2)
+    return max(1, _as_int(configured, default))
+
+
+def _get_seller_profile_cache_ttl(task_config: dict) -> int:
+    configured = task_config.get("seller_profile_cache_ttl")
+    default = _as_int(os.getenv("SELLER_PROFILE_CACHE_TTL"), 1800)
+    return max(0, _as_int(configured, default))
 
 
 def _default_context_options() -> dict:
@@ -553,41 +462,34 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
     if new_publish_option == "__none__":
         new_publish_option = ""
     region_filter = (task_config.get("region") or "").strip()
-    hook_registry = _build_hook_registry(task_config)
 
     processed_links = set()
-    output_filename = os.path.join(
-        "jsonl", f"{keyword.replace(' ', '_')}_full_data.jsonl"
-    )
-    if os.path.exists(output_filename):
-        print(f"LOG: 发现已存在文件 {output_filename}，正在加载历史记录以去重...")
-        try:
-            with open(output_filename, "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        record = json.loads(line)
-                        link = record.get("商品信息", {}).get("商品链接", "")
-                        if link:
-                            processed_links.add(get_link_unique_key(link))
-                    except json.JSONDecodeError:
-                        print(f"   [警告] 文件中有一行无法解析为JSON，已跳过。")
-            print(f"LOG: 加载完成，已记录 {len(processed_links)} 个已处理过的商品。")
-        except IOError as e:
-            print(f"   [警告] 读取历史文件时发生错误: {e}")
+    history_run_id = datetime.now().strftime("%Y%m%d%H%M%S")
+    history_seen_item_ids: set[str] = set()
+    historical_snapshots = load_price_snapshots(keyword)
+    result_filename = build_result_filename(keyword)
+    processed_links = load_processed_link_keys(keyword)
+    if processed_links:
+        print(f"LOG: 发现已存在结果集 {result_filename}，已加载 {len(processed_links)} 个历史商品用于去重。")
     else:
-        print(f"LOG: 输出文件 {output_filename} 不存在，将创建新文件。")
+        print(f"LOG: 结果集 {result_filename} 当前为空，将写入新记录。")
 
     rotation_settings = _get_rotation_settings(task_config)
-    forced_account = task_config.get("account_state_file") or None
-    if isinstance(forced_account, str) and not forced_account.strip():
-        forced_account = None
-    if forced_account:
-        rotation_settings["account_enabled"] = False
     account_items = load_state_files(rotation_settings["account_state_dir"])
-    if not forced_account and os.path.exists(STATE_FILE):
+    runtime_plan = resolve_account_runtime_plan(
+        strategy=task_config.get("account_strategy"),
+        account_state_file=task_config.get("account_state_file"),
+        has_root_state_file=os.path.exists(STATE_FILE),
+        available_account_files=account_items,
+    )
+    forced_account = runtime_plan["forced_account"]
+    if runtime_plan["prefer_root_state"]:
         account_items = [STATE_FILE]
-    if not forced_account and not os.path.exists(STATE_FILE) and account_items:
+        rotation_settings["account_enabled"] = False
+    elif runtime_plan["use_account_pool"]:
         rotation_settings["account_enabled"] = True
+    else:
+        rotation_settings["account_enabled"] = False
 
     account_pool = RotationPool(
         account_items, rotation_settings["account_blacklist_ttl"], "account"
@@ -660,19 +562,13 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
             if proxy_server:
                 launch_kwargs["proxy"] = {"server": proxy_server}
 
-            if BROWSER_EXECUTABLE_PATH:
-                launch_kwargs["executable_path"] = BROWSER_EXECUTABLE_PATH
-            else:
-                if LOGIN_IS_EDGE:
-                    launch_kwargs["channel"] = "msedge"
-                else:
-                    if not RUNNING_IN_DOCKER:
-                        launch_kwargs["channel"] = "chrome"
+            launch_kwargs["channel"] = _resolve_browser_channel()
 
             browser = await p.chromium.launch(**launch_kwargs)
 
             context_kwargs = _default_context_options()
             storage_state_arg = state_file
+            analysis_dispatcher: Optional[ItemAnalysisDispatcher] = None
 
             if isinstance(snapshot_data, dict):
                 # 新版扩展导出的增强快照，包含环境和Header
@@ -692,6 +588,21 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
             context_kwargs = _clean_kwargs(context_kwargs)
             context = await browser.new_context(
                 storage_state=storage_state_arg, **context_kwargs
+            )
+            seller_profile_cache = SellerProfileCache(
+                ttl_seconds=_get_seller_profile_cache_ttl(task_config)
+            )
+            analysis_dispatcher = ItemAnalysisDispatcher(
+                concurrency=_get_ai_analysis_concurrency(task_config),
+                skip_ai_analysis=SKIP_AI_ANALYSIS,
+                seller_loader=lambda user_id: seller_profile_cache.get_or_load(
+                    str(user_id),
+                    lambda seller_key: scrape_user_profile(context, seller_key),
+                ),
+                image_downloader=download_all_images,
+                ai_analyzer=get_ai_analysis,
+                notifier=send_ntfy_notification,
+                saver=save_to_jsonl,
             )
 
             # 增强反检测脚本（模拟真实移动设备）
@@ -1011,32 +922,14 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                     log_time(f"开始处理第 {page_num}/{max_pages} 页 ...")
 
                     if page_num > 1:
-                        # 查找未被禁用的“下一页”按钮。闲鱼通过添加 'disabled' 类名来禁用按钮，而不是使用 disabled 属性。
-                        next_btn = page.locator(
-                            "[class*='search-pagination-arrow-right']:not([class*='disabled'])"
+                        page_advance_result = await advance_search_page(
+                            page=page,
+                            page_num=page_num,
+                            api_url_pattern=API_URL_PATTERN,
                         )
-                        if not await next_btn.count():
-                            log_time(
-                                "已到达最后一页，未找到可用的'下一页'按钮，停止翻页。"
-                            )
+                        if not page_advance_result.advanced:
                             break
-                        max_page_retries = 2
-                        for page_retry in range(max_page_retries):
-                            try:
-                                async with page.expect_response(
-                                    lambda r: API_URL_PATTERN in r.url, timeout=20000
-                                ) as response_info:
-                                    await next_btn.click()
-                                    await random_sleep(2, 5)
-                                current_response = await response_info.value
-                                break
-                            except PlaywrightTimeoutError:
-                                if page_retry < max_page_retries - 1:
-                                    log_time(f"翻页到第 {page_num} 页超时，{max_page_retries - page_retry - 1}秒后重试...")
-                                    await asyncio.sleep(5)
-                                else:
-                                    log_time(f"翻页到第 {page_num} 页超时 {max_page_retries} 次，停止翻页。")
-                                    break
+                        current_response = page_advance_result.response
 
                     if not (current_response and current_response.ok):
                         log_time(f"第 {page_num} 页响应无效，跳过。")
@@ -1047,6 +940,16 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                     )
                     if not basic_items:
                         break
+                    historical_snapshots.extend(
+                        record_market_snapshots(
+                            keyword=keyword,
+                            task_name=task_config.get("task_name", "Untitled Task"),
+                            items=basic_items,
+                            run_id=history_run_id,
+                            snapshot_time=datetime.now().isoformat(),
+                            seen_item_ids=history_seen_item_ids,
+                        )
+                    )
 
                     total_items_on_page = len(basic_items)
                     for i, item_data in enumerate(basic_items, 1):
@@ -1067,31 +970,6 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                         log_time(
                             f"[页内进度 {i}/{total_items_on_page}] 发现新商品，获取详情: {item_data['商品标题'][:30]}..."
                         )
-
-                        discover_hook_ctx = {
-                            "task_config": task_config,
-                            "item_data": item_data,
-                            "page_num": page_num,
-                            "item_index": i,
-                            "total_items_on_page": total_items_on_page,
-                        }
-                        discover_decision = await hook_registry.run(
-                            HookStage.ITEM_DISCOVERED, discover_hook_ctx
-                        )
-                        item_data = discover_hook_ctx.get("item_data", item_data)
-                        if discover_decision.stop_task:
-                            log_time(
-                                f"Hook 要求停止任务，原因: {discover_decision.reason or 'N/A'}"
-                            )
-                            stop_scraping = True
-                            break
-                        if discover_decision.skip_item or not discover_decision.proceed:
-                            log_time(
-                                f"Hook 跳过商品: {discover_decision.reason or '未提供原因'}"
-                            )
-                            processed_links.add(unique_key)
-                            continue
-
                         # --- 修改: 访问详情页前的等待时间，模拟用户在列表页上看了一会儿 ---
                         await random_sleep(2, 4)  # 原来是 (2, 4)
 
@@ -1181,55 +1059,7 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                                 )
                                 # ...[此处可添加更多从详情页解析出的商品信息]...
 
-                                before_seller_ctx = {
-                                    "task_config": task_config,
-                                    "item_data": item_data,
-                                    "detail_json": detail_json,
-                                    "seller_do": seller_do,
-                                    "page_num": page_num,
-                                    "item_index": i,
-                                    "skip_seller_profile": False,
-                                }
-                                before_seller_decision = await hook_registry.run(
-                                    HookStage.BEFORE_SELLER_PROFILE, before_seller_ctx
-                                )
-                                item_data = before_seller_ctx.get("item_data", item_data)
-                                seller_do = before_seller_ctx.get("seller_do", seller_do)
-                                if before_seller_decision.stop_task:
-                                    log_time(
-                                        f"Hook 在卖家采集前终止任务，原因: {before_seller_decision.reason or 'N/A'}"
-                                    )
-                                    stop_scraping = True
-                                    break
-                                if (
-                                    before_seller_decision.skip_item
-                                    or not before_seller_decision.proceed
-                                ):
-                                    log_time(
-                                        f"Hook 在卖家采集前跳过商品: {before_seller_decision.reason or 'N/A'}"
-                                    )
-                                    processed_links.add(unique_key)
-                                    continue
-
-                                # 调用核心函数采集卖家信息
-                                user_profile_data = {}
                                 user_id = await safe_get(seller_do, "sellerId")
-                                skip_seller_profile = bool(
-                                    before_seller_ctx.get("skip_seller_profile", False)
-                                )
-                                if skip_seller_profile:
-                                    log_time("Hook 指示跳过卖家主页采集，仅保留详情页卖家字段。")
-                                elif user_id:
-                                    # 新的、高效的调用方式:
-                                    user_profile_data = await scrape_user_profile(
-                                        context, str(user_id)
-                                    )
-                                else:
-                                    print("   [警告] 未能从详情API中获取到卖家ID。")
-                                user_profile_data["卖家芝麻信用"] = zhima_credit_text
-                                user_profile_data["卖家注册时长"] = (
-                                    registration_duration_text
-                                )
 
                                 # 构建基础记录
                                 final_record = {
@@ -1239,290 +1069,40 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                                         "task_name", "Untitled Task"
                                     ),
                                     "商品信息": item_data,
-                                    "卖家信息": user_profile_data,
+                                    "卖家信息": {},
                                 }
-
-                                pre_analysis_ctx = {
-                                    "task_config": task_config,
-                                    "item_data": item_data,
-                                    "final_record": final_record,
-                                    "detail_json": detail_json,
-                                    "page_num": page_num,
-                                    "item_index": i,
-                                }
-                                pre_analysis_decision = await hook_registry.run(
-                                    HookStage.ITEM_READY_FOR_ANALYSIS, pre_analysis_ctx
+                                price_reference = build_market_reference(
+                                    keyword=keyword,
+                                    item=item_data,
+                                    current_market_items=basic_items,
+                                    historical_snapshots=historical_snapshots,
                                 )
-                                item_data = pre_analysis_ctx.get("item_data", item_data)
-                                final_record = pre_analysis_ctx.get(
-                                    "final_record", final_record
+                                final_record["价格参考"] = price_reference
+                                final_record["price_insight"] = price_reference.get(
+                                    "本商品价格位置", {}
                                 )
-                                if pre_analysis_decision.stop_task:
-                                    final_record["hook_decision"] = {
-                                        "stage": HookStage.ITEM_READY_FOR_ANALYSIS,
-                                        "action": "stop_task",
-                                        "reason": pre_analysis_decision.reason or "",
-                                    }
-                                    await save_to_jsonl(final_record, keyword)
-                                    processed_links.add(unique_key)
-                                    processed_item_count += 1
-                                    stop_scraping = True
-                                    log_time(
-                                        f"Hook 在分析前终止任务，原因: {pre_analysis_decision.reason or 'N/A'}"
+
+                                analysis_dispatcher.submit(
+                                    ItemAnalysisJob(
+                                        keyword=keyword,
+                                        task_name=task_config.get(
+                                            "task_name", "Untitled Task"
+                                        ),
+                                        decision_mode=decision_mode,
+                                        analyze_images=analyze_images,
+                                        prompt_text=ai_prompt_text,
+                                        keyword_rules=tuple(keyword_rules or []),
+                                        final_record=final_record,
+                                        seller_id=str(user_id) if user_id else None,
+                                        zhima_credit_text=zhima_credit_text,
+                                        registration_duration_text=registration_duration_text,
                                     )
-                                    break
-                                if (
-                                    pre_analysis_decision.skip_item
-                                    or not pre_analysis_decision.proceed
-                                ):
-                                    final_record["hook_decision"] = {
-                                        "stage": HookStage.ITEM_READY_FOR_ANALYSIS,
-                                        "action": "skip_item",
-                                        "reason": pre_analysis_decision.reason or "",
-                                    }
-                                    await save_to_jsonl(final_record, keyword)
-                                    processed_links.add(unique_key)
-                                    processed_item_count += 1
-                                    log_time(
-                                        f"Hook 在分析前跳过后续流程: {pre_analysis_decision.reason or 'N/A'}"
-                                    )
-                                    continue
-
-                                # --- START: Real-time Analysis & Notification ---
-                                ai_analysis_result = None
-                                if decision_mode == "keyword":
-                                    search_text = build_search_text(final_record)
-                                    ai_analysis_result = evaluate_keyword_rules(
-                                        keyword_rules, search_text
-                                    )
-                                    final_record["ai_analysis"] = ai_analysis_result
-                                    log_time(
-                                        f"关键词判断完成。推荐状态: {ai_analysis_result.get('is_recommended')}"
-                                    )
-
-                                    if ai_analysis_result.get("is_recommended"):
-                                        before_notify_ctx = {
-                                            "task_config": task_config,
-                                            "item_data": item_data,
-                                            "final_record": final_record,
-                                            "ai_analysis_result": ai_analysis_result,
-                                        }
-                                        notify_decision = await hook_registry.run(
-                                            HookStage.BEFORE_NOTIFICATION,
-                                            before_notify_ctx,
-                                        )
-                                        if (
-                                            not notify_decision.stop_task
-                                            and not notify_decision.skip_item
-                                            and notify_decision.proceed
-                                        ):
-                                            log_time("商品命中关键词规则，准备发送通知...")
-                                            await send_ntfy_notification(
-                                                item_data,
-                                                ai_analysis_result.get("reason", "无"),
-                                            )
-                                else:
-                                    from src.config import SKIP_AI_ANALYSIS
-
-                                    # 检查是否跳过AI分析并直接发送通知
-                                    if SKIP_AI_ANALYSIS:
-                                        log_time(
-                                            "环境变量 SKIP_AI_ANALYSIS 已设置，跳过AI分析并直接发送通知..."
-                                        )
-                                        downloaded_image_paths = []
-                                        if analyze_images:
-                                            image_urls = item_data.get("商品图片列表", [])
-                                            downloaded_image_paths = (
-                                                await download_all_images(
-                                                    item_data["商品ID"],
-                                                    image_urls,
-                                                    task_config.get("task_name", "default"),
-                                                )
-                                            )
-                                        else:
-                                            log_time(
-                                                "当前任务已关闭图片分析，跳过图片下载。"
-                                            )
-
-                                        # 删除下载的图片文件，节省空间
-                                        for img_path in downloaded_image_paths:
-                                            try:
-                                                if os.path.exists(img_path):
-                                                    os.remove(img_path)
-                                                    print(
-                                                        f"   [图片] 已删除临时图片文件: {img_path}"
-                                                    )
-                                            except Exception as e:
-                                                print(
-                                                    f"   [图片] 删除图片文件时出错: {e}"
-                                                )
-
-                                        ai_analysis_result = {
-                                            "analysis_source": "ai",
-                                            "is_recommended": True,
-                                            "reason": "商品已跳过AI分析，直接通知",
-                                            "keyword_hit_count": 0,
-                                        }
-                                        final_record["ai_analysis"] = ai_analysis_result
-
-                                        # 直接发送通知，将所有商品标记为推荐
-                                        before_notify_ctx = {
-                                            "task_config": task_config,
-                                            "item_data": item_data,
-                                            "final_record": final_record,
-                                            "ai_analysis_result": ai_analysis_result,
-                                        }
-                                        notify_decision = await hook_registry.run(
-                                            HookStage.BEFORE_NOTIFICATION,
-                                            before_notify_ctx,
-                                        )
-                                        if (
-                                            not notify_decision.stop_task
-                                            and not notify_decision.skip_item
-                                            and notify_decision.proceed
-                                        ):
-                                            log_time("商品已跳过AI分析，准备发送通知...")
-                                            await send_ntfy_notification(
-                                                item_data, ai_analysis_result["reason"]
-                                            )
-                                    else:
-                                        log_time(
-                                            f"开始对商品 #{item_data['商品ID']} 进行实时AI分析..."
-                                        )
-                                        downloaded_image_paths = []
-                                        if analyze_images:
-                                            image_urls = item_data.get("商品图片列表", [])
-                                            downloaded_image_paths = (
-                                                await download_all_images(
-                                                    item_data["商品ID"],
-                                                    image_urls,
-                                                    task_config.get("task_name", "default"),
-                                                )
-                                            )
-                                        else:
-                                            log_time(
-                                                "当前任务已关闭图片分析，跳过图片下载，仅分析商品文字和卖家资质。"
-                                            )
-
-                                        # 2. Get AI analysis
-                                        if ai_prompt_text:
-                                            try:
-                                                # 注意：这里我们将整个记录传给AI，让它拥有最全的上下文
-                                                ai_analysis_result = (
-                                                    await get_ai_analysis(
-                                                        final_record,
-                                                        downloaded_image_paths,
-                                                        prompt_text=ai_prompt_text,
-                                                    )
-                                                )
-                                                if ai_analysis_result:
-                                                    ai_analysis_result.setdefault(
-                                                        "analysis_source", "ai"
-                                                    )
-                                                    ai_analysis_result.setdefault(
-                                                        "keyword_hit_count", 0
-                                                    )
-                                                    final_record["ai_analysis"] = (
-                                                        ai_analysis_result
-                                                    )
-                                                    log_time(
-                                                        f"AI分析完成。推荐状态: {ai_analysis_result.get('is_recommended')}"
-                                                    )
-                                                else:
-                                                    ai_analysis_result = {
-                                                        "analysis_source": "ai",
-                                                        "is_recommended": False,
-                                                        "reason": "AI analysis returned None after retries.",
-                                                        "error": "AI analysis returned None after retries.",
-                                                        "keyword_hit_count": 0,
-                                                    }
-                                                    final_record["ai_analysis"] = (
-                                                        ai_analysis_result
-                                                    )
-                                            except Exception as e:
-                                                print(
-                                                    f"   -> AI分析过程中发生严重错误: {e}"
-                                                )
-                                                ai_analysis_result = {
-                                                    "analysis_source": "ai",
-                                                    "is_recommended": False,
-                                                    "reason": f"AI分析异常: {e}",
-                                                    "error": str(e),
-                                                    "keyword_hit_count": 0,
-                                                }
-                                                final_record["ai_analysis"] = (
-                                                    ai_analysis_result
-                                                )
-                                        else:
-                                            print(
-                                                "   -> 任务未配置AI prompt，跳过分析。"
-                                            )
-                                            ai_analysis_result = {
-                                                "analysis_source": "ai",
-                                                "is_recommended": False,
-                                                "reason": "任务未配置AI prompt，跳过分析。",
-                                                "keyword_hit_count": 0,
-                                            }
-                                            final_record["ai_analysis"] = (
-                                                ai_analysis_result
-                                            )
-
-                                        # 删除下载的图片文件，节省空间
-                                        for img_path in downloaded_image_paths:
-                                            try:
-                                                if os.path.exists(img_path):
-                                                    os.remove(img_path)
-                                                    print(
-                                                        f"   [图片] 已删除临时图片文件: {img_path}"
-                                                    )
-                                            except Exception as e:
-                                                print(
-                                                    f"   [图片] 删除图片文件时出错: {e}"
-                                                )
-
-                                        # 3. Send notification if recommended
-                                        if (
-                                            ai_analysis_result
-                                            and ai_analysis_result.get("is_recommended")
-                                        ):
-                                            before_notify_ctx = {
-                                                "task_config": task_config,
-                                                "item_data": item_data,
-                                                "final_record": final_record,
-                                                "ai_analysis_result": ai_analysis_result,
-                                            }
-                                            notify_decision = await hook_registry.run(
-                                                HookStage.BEFORE_NOTIFICATION,
-                                                before_notify_ctx,
-                                            )
-                                            if (
-                                                not notify_decision.stop_task
-                                                and not notify_decision.skip_item
-                                                and notify_decision.proceed
-                                            ):
-                                                log_time("商品被AI推荐，准备发送通知...")
-                                                await send_ntfy_notification(
-                                                    item_data,
-                                                    ai_analysis_result.get("reason", "无"),
-                                                )
-                                # --- END: Real-time Analysis & Notification ---
-
-                                # 4. 保存包含AI结果的完整记录
-                                await save_to_jsonl(final_record, keyword)
-
-                                await hook_registry.run(
-                                    HookStage.ITEM_COMPLETED,
-                                    {
-                                        "task_config": task_config,
-                                        "item_data": item_data,
-                                        "final_record": final_record,
-                                    },
                                 )
 
                                 processed_links.add(unique_key)
                                 processed_item_count += 1
                                 log_time(
-                                    f"商品处理流程完毕。累计处理 {processed_item_count} 个新商品。"
+                                    f"商品已提交后台分析。累计处理 {processed_item_count} 个新商品。"
                                 )
 
                                 # --- 修改: 增加单个商品处理后的主要延迟 ---
@@ -1583,6 +1163,9 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                 print(f"\n爬取过程中发生未知错误: {e}")
                 raise
             finally:
+                if analysis_dispatcher is not None:
+                    log_time("等待后台分析任务完成...")
+                    await analysis_dispatcher.join()
                 log_time("任务执行完毕，浏览器将在5秒后自动关闭...")
                 await asyncio.sleep(5)
                 if debug_limit:

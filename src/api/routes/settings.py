@@ -5,26 +5,36 @@ import os
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 
 from src.api.dependencies import get_process_service
 from src.infrastructure.config.env_manager import env_manager
 from src.infrastructure.config.settings import (
     AISettings,
-    NotificationSettings,
     reload_settings,
     scraper_settings,
 )
+from src.services.notification_config_service import (
+    NotificationSettingsValidationError,
+    build_configured_channels,
+    build_notification_settings_response,
+    build_notification_status_flags,
+    load_notification_settings,
+    model_dump,
+    prepare_notification_settings_update,
+)
+from src.services.notification_service import build_notification_service
 from src.services.process_service import ProcessService
 
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
-AI_DEBUG_MODE = os.getenv("AI_DEBUG_MODE", "false").lower() == "true"
+
 
 def _reload_env() -> None:
     load_dotenv(dotenv_path=env_manager.env_file, override=True)
     reload_settings()
+
 
 def _env_bool(key: str, default: bool = False) -> bool:
     value = env_manager.get_value(key)
@@ -49,6 +59,7 @@ def _normalize_bool_value(value: bool) -> str:
 
 class NotificationSettingsModel(BaseModel):
     """通知设置模型"""
+
     NTFY_TOPIC_URL: Optional[str] = None
     GOTIFY_URL: Optional[str] = None
     GOTIFY_TOKEN: Optional[str] = None
@@ -65,8 +76,16 @@ class NotificationSettingsModel(BaseModel):
     PCURL_TO_MOBILE: Optional[bool] = None
 
 
+class NotificationTestRequest(BaseModel):
+    """通知测试请求"""
+
+    channel: Optional[str] = None
+    settings: NotificationSettingsModel = Field(default_factory=NotificationSettingsModel)
+
+
 class AISettingsModel(BaseModel):
     """AI设置模型"""
+
     OPENAI_API_KEY: Optional[str] = None
     OPENAI_BASE_URL: Optional[str] = None
     OPENAI_MODEL_NAME: Optional[str] = None
@@ -75,6 +94,11 @@ class AISettingsModel(BaseModel):
 
 
 class RotationSettingsModel(BaseModel):
+    ACCOUNT_ROTATION_ENABLED: Optional[bool] = None
+    ACCOUNT_ROTATION_MODE: Optional[str] = None
+    ACCOUNT_ROTATION_RETRY_LIMIT: Optional[int] = None
+    ACCOUNT_BLACKLIST_TTL: Optional[int] = None
+    ACCOUNT_STATE_DIR: Optional[str] = None
     PROXY_ROTATION_ENABLED: Optional[bool] = None
     PROXY_ROTATION_MODE: Optional[str] = None
     PROXY_POOL: Optional[str] = None
@@ -84,46 +108,67 @@ class RotationSettingsModel(BaseModel):
 
 @router.get("/notifications")
 async def get_notification_settings():
-    """获取通知设置"""
-    return {
-        "NTFY_TOPIC_URL": env_manager.get_value("NTFY_TOPIC_URL", ""),
-        "GOTIFY_URL": env_manager.get_value("GOTIFY_URL", ""),
-        "GOTIFY_TOKEN": env_manager.get_value("GOTIFY_TOKEN", ""),
-        "BARK_URL": env_manager.get_value("BARK_URL", ""),
-        "WX_BOT_URL": env_manager.get_value("WX_BOT_URL", ""),
-        "TELEGRAM_BOT_TOKEN": env_manager.get_value("TELEGRAM_BOT_TOKEN", ""),
-        "TELEGRAM_CHAT_ID": env_manager.get_value("TELEGRAM_CHAT_ID", ""),
-        "WEBHOOK_URL": env_manager.get_value("WEBHOOK_URL", ""),
-        "WEBHOOK_METHOD": env_manager.get_value("WEBHOOK_METHOD", "POST"),
-        "WEBHOOK_HEADERS": env_manager.get_value("WEBHOOK_HEADERS", ""),
-        "WEBHOOK_CONTENT_TYPE": env_manager.get_value("WEBHOOK_CONTENT_TYPE", "JSON"),
-        "WEBHOOK_QUERY_PARAMETERS": env_manager.get_value("WEBHOOK_QUERY_PARAMETERS", ""),
-        "WEBHOOK_BODY": env_manager.get_value("WEBHOOK_BODY", ""),
-        "PCURL_TO_MOBILE": _env_bool("PCURL_TO_MOBILE", True),
-    }
+    return build_notification_settings_response(load_notification_settings())
 
 
 @router.put("/notifications")
-async def update_notification_settings(
-    settings: NotificationSettingsModel,
-):
-    """更新通知设置"""
-    updates = {}
-    payload = settings.dict(exclude_none=True)
-    for key, value in payload.items():
-        if isinstance(value, bool):
-            updates[key] = _normalize_bool_value(value)
-        else:
-            updates[key] = str(value)
-    success = env_manager.update_values(updates)
-    if success:
-        _reload_env()
-        return {"message": "通知设置已成功更新"}
-    return {"message": "更新通知设置失败"}
+async def update_notification_settings(settings: NotificationSettingsModel):
+    try:
+        updates, deletions, merged_settings = prepare_notification_settings_update(
+            model_dump(settings, exclude_unset=True),
+            load_notification_settings(),
+        )
+    except NotificationSettingsValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    success = env_manager.apply_changes(updates=updates, deletions=deletions)
+    if not success:
+        raise HTTPException(status_code=500, detail="更新通知设置失败")
+
+    _reload_env()
+    return {
+        "message": "通知设置已成功更新",
+        "configured_channels": build_configured_channels(merged_settings),
+    }
+
+
+@router.post("/notifications/test")
+async def test_notification_settings(payload: NotificationTestRequest):
+    try:
+        _, _, merged_settings = prepare_notification_settings_update(
+            model_dump(payload.settings, exclude_unset=True),
+            load_notification_settings(),
+        )
+    except NotificationSettingsValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    service = build_notification_service(merged_settings)
+    if not service.clients:
+        raise HTTPException(status_code=422, detail="请至少配置一个可用的通知渠道")
+
+    results = await service.send_test_notification()
+    if payload.channel:
+        if payload.channel not in results:
+            raise HTTPException(
+                status_code=422,
+                detail=f"渠道 {payload.channel} 未配置或不受支持",
+            )
+        results = {payload.channel: results[payload.channel]}
+
+    return {
+        "message": "测试通知已执行",
+        "results": results,
+    }
+
 
 @router.get("/rotation")
 async def get_rotation_settings():
     return {
+        "ACCOUNT_ROTATION_ENABLED": _env_bool("ACCOUNT_ROTATION_ENABLED", False),
+        "ACCOUNT_ROTATION_MODE": env_manager.get_value("ACCOUNT_ROTATION_MODE", "per_task"),
+        "ACCOUNT_ROTATION_RETRY_LIMIT": _env_int("ACCOUNT_ROTATION_RETRY_LIMIT", 2),
+        "ACCOUNT_BLACKLIST_TTL": _env_int("ACCOUNT_BLACKLIST_TTL", 300),
+        "ACCOUNT_STATE_DIR": env_manager.get_value("ACCOUNT_STATE_DIR", "state"),
         "PROXY_ROTATION_ENABLED": _env_bool("PROXY_ROTATION_ENABLED", False),
         "PROXY_ROTATION_MODE": env_manager.get_value("PROXY_ROTATION_MODE", "per_task"),
         "PROXY_POOL": env_manager.get_value("PROXY_POOL", ""),
@@ -133,48 +178,39 @@ async def get_rotation_settings():
 
 
 @router.put("/rotation")
-async def update_rotation_settings(
-    settings: RotationSettingsModel,
-):
+async def update_rotation_settings(settings: RotationSettingsModel):
     updates = {}
-    payload = settings.dict(exclude_none=True)
+    payload = model_dump(settings, exclude_unset=True)
     for key, value in payload.items():
         if isinstance(value, bool):
             updates[key] = _normalize_bool_value(value)
         else:
             updates[key] = str(value)
     success = env_manager.update_values(updates)
-    if success:
-        _reload_env()
-        return {"message": "轮换设置已成功更新"}
-    return {"message": "更新轮换设置失败"}
+    if not success:
+        raise HTTPException(status_code=500, detail="更新轮换设置失败")
+    _reload_env()
+    return {"message": "轮换设置已成功更新"}
 
 
 @router.get("/status")
 async def get_system_status(
     process_service: ProcessService = Depends(get_process_service),
 ):
-    """获取系统状态"""
     state_file = "xianyu_state.json"
     login_state_exists = os.path.exists(state_file)
-
-    # 检查 .env 文件
-    env_file_exists = os.path.exists(".env")
-
-    # 检查关键环境变量是否设置
+    env_file_exists = os.path.exists(env_manager.env_file)
     openai_api_key = env_manager.get_value("OPENAI_API_KEY", "")
     openai_base_url = env_manager.get_value("OPENAI_BASE_URL", "")
     openai_model_name = env_manager.get_value("OPENAI_MODEL_NAME", "")
-    ntfy_topic_url = env_manager.get_value("NTFY_TOPIC_URL", "")
-
     ai_settings = AISettings()
+    notification_settings = load_notification_settings()
     running_task_ids = [
         task_id
         for task_id, process in process_service.processes.items()
         if process and process.returncode is None
     ]
 
-    notification_settings = NotificationSettings()
     return {
         "ai_configured": ai_settings.is_configured(),
         "notification_configured": notification_settings.has_any_notification_enabled(),
@@ -184,41 +220,31 @@ async def get_system_status(
         "running_task_ids": running_task_ids,
         "login_state_file": {
             "exists": login_state_exists,
-            "path": state_file
+            "path": state_file,
         },
         "env_file": {
             "exists": env_file_exists,
             "openai_api_key_set": bool(openai_api_key),
             "openai_base_url_set": bool(openai_base_url),
             "openai_model_name_set": bool(openai_model_name),
-            "ntfy_topic_url_set": bool(ntfy_topic_url)
-        }
+            **build_notification_status_flags(notification_settings),
+        },
+        "configured_notification_channels": build_configured_channels(notification_settings),
     }
-
-
-class AISettingsModel(BaseModel):
-    """AI设置模型"""
-    OPENAI_API_KEY: Optional[str] = None
-    OPENAI_BASE_URL: Optional[str] = None
-    OPENAI_MODEL_NAME: Optional[str] = None
-    SKIP_AI_ANALYSIS: Optional[bool] = None
 
 
 @router.get("/ai")
 async def get_ai_settings():
-    """获取AI设置"""
     return {
         "OPENAI_BASE_URL": env_manager.get_value("OPENAI_BASE_URL", ""),
         "OPENAI_MODEL_NAME": env_manager.get_value("OPENAI_MODEL_NAME", ""),
-        "SKIP_AI_ANALYSIS": env_manager.get_value("SKIP_AI_ANALYSIS", "false").lower() == "true"
+        "SKIP_AI_ANALYSIS": env_manager.get_value("SKIP_AI_ANALYSIS", "false").lower() == "true",
+        "PROXY_URL": env_manager.get_value("PROXY_URL", ""),
     }
 
 
 @router.put("/ai")
-async def update_ai_settings(
-    settings: AISettingsModel,
-):
-    """更新AI设置"""
+async def update_ai_settings(settings: AISettingsModel):
     updates = {}
     if settings.OPENAI_API_KEY is not None:
         updates["OPENAI_API_KEY"] = settings.OPENAI_API_KEY
@@ -228,18 +254,18 @@ async def update_ai_settings(
         updates["OPENAI_MODEL_NAME"] = settings.OPENAI_MODEL_NAME
     if settings.SKIP_AI_ANALYSIS is not None:
         updates["SKIP_AI_ANALYSIS"] = str(settings.SKIP_AI_ANALYSIS).lower()
+    if settings.PROXY_URL is not None:
+        updates["PROXY_URL"] = settings.PROXY_URL
 
     success = env_manager.update_values(updates)
-    if success:
-        _reload_env()
-        return {"message": "AI设置已成功更新"}
-    return {"message": "更新AI设置失败"}
+    if not success:
+        raise HTTPException(status_code=500, detail="更新AI设置失败")
+    _reload_env()
+    return {"message": "AI设置已成功更新"}
 
 
 @router.post("/ai/test")
-async def test_ai_settings(
-    settings: dict,
-):
+async def test_ai_settings(settings: dict):
     """测试AI模型设置是否有效"""
     try:
         import requests
@@ -259,13 +285,14 @@ async def test_ai_settings(
         if not base_url or not model_name:
             return {
                 "success": False,
-                "message": "AI模型连接测试失败: OPENAI_BASE_URL 或 OPENAI_MODEL_NAME 为空"
+                "message": "AI模型连接测试失败: OPENAI_BASE_URL 或 OPENAI_MODEL_NAME 为空",
             }
 
-        # 优先使用本次提交代理，其次回退环境变量
-        proxy_url = (settings.get("PROXY_URL", "") or env_manager.get_value("PROXY_URL", "") or "").strip()
-
-        print(f"AI测试 - BASE_URL: {base_url}, MODEL: {model_name}, PROXY_SET: {bool(proxy_url)}")
+        proxy_url = (
+            settings.get("PROXY_URL", "")
+            or env_manager.get_value("PROXY_URL", "")
+            or ""
+        ).strip()
 
         test_payload = {
             "model": model_name,
@@ -273,52 +300,46 @@ async def test_ai_settings(
             "max_tokens": 10,
         }
 
-        try:
-            url = f"{base_url}/chat/completions"
-            headers = {
-                "Content-Type": "application/json",
-            }
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
-            session = requests.Session()
-            session.trust_env = False
-            proxies = None
-            if proxy_url:
-                proxies = {"http": proxy_url, "https": proxy_url}
-            raw_resp = session.post(url, headers=headers, json=test_payload, timeout=30, proxies=proxies)
-            if raw_resp.status_code == 200:
-                data = raw_resp.json()
-                content = (
-                    data.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "No response")
-                )
-                return {
-                    "success": True,
-                    "message": "AI模型连接测试成功！（原生HTTP）",
-                    "response": content
-                }
+        url = f"{base_url}/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+        }
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
 
-            body_preview = raw_resp.text[:300]
+        session = requests.Session()
+        session.trust_env = False
+        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+        raw_resp = session.post(
+            url,
+            headers=headers,
+            json=test_payload,
+            timeout=30,
+            proxies=proxies,
+        )
+        if raw_resp.status_code != 200:
             return {
                 "success": False,
                 "message": (
                     "AI模型连接测试失败: "
-                    f"HTTP状态码: {raw_resp.status_code}, 响应: {body_preview}"
+                    f"HTTP状态码: {raw_resp.status_code}, 响应: {raw_resp.text[:300]}"
                 ),
             }
-        except Exception as raw_error:
-            return {
-                "success": False,
-                "message": (
-                    "AI模型连接测试失败: "
-                    f"原生HTTP报错: {str(raw_error)}"
-                ),
-            }
-    except Exception as e:
-        if AI_DEBUG_MODE:
-            print(f"AI测试 - ERROR: {e}")
+
+        data = raw_resp.json()
+        content = (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "No response")
+        )
+
+        return {
+            "success": True,
+            "message": "AI模型连接测试成功！（原生HTTP）",
+            "response": content,
+        }
+    except Exception as exc:
         return {
             "success": False,
-            "message": f"AI模型连接测试失败: {str(e)}"
+            "message": f"AI模型连接测试失败: {exc}",
         }

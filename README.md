@@ -17,30 +17,43 @@
 
 ## 截图
 
-![任务管理](static/img.png)
-![监控界面](static/img_1.png)
-![通知示例](static/img_2.png)
+![监控概览](static/img.png)
+![任务管理](static/img_1.png)
+![结果查看](static/img_2.png)
+![通知推送](static/img_3.png)
 
-## 🐳 Docker 部署(推荐方式)
+## 🐳 Docker 部署（推荐）
 
 ```bash
 git clone https://github.com/Usagi-org/ai-goofish-monitor && cd ai-goofish-monitor
-cp .env.example .env 
+cp .env.example .env
 vim .env # 填写相关配置项
 docker compose up -d
 docker compose logs -f app
 docker compose down
 ```
 
-- Web UI 地址：`http://127.0.0.1:8181`
+- 默认 Web UI 地址：`http://127.0.0.1:8000`
+- Docker 镜像已内置 Chromium，无需宿主机额外安装浏览器。
 - 更新镜像：`docker compose pull && docker compose up -d`
-- `docker-compose.yaml` 默认已挂载并持久化以下数据：
-    - `state/`  登录状态cookie文件
-    - `config.json`  任务配置
-    - `prompts/`  任务的提示词
-    - `jsonl/`  结果数据
+- 如果你修改了 `.env` 中的 `SERVER_PORT`，请同步更新 `docker-compose.yaml` 里的端口映射。
+- `docker-compose.yaml` 默认会把 SQLite 主库挂载到 `./data:/app/data`，数据库文件默认为 `data/app.sqlite3`
+- 目前默认持久化这些目录：
+    - `data/`  SQLite 主存储（任务、结果、价格历史）
+    - `state/`  登录状态 cookie 文件
+    - `prompts/`  任务提示词
     - `logs/`  运行日志
-    - `images/`  商品图片
+    - `images/`  商品图片与任务临时图片目录
+    - `config.json`、`jsonl/`、`price_history/`  首次升级到 SQLite 时用于兼容导入的旧数据源
+
+### 数据存储与迁移
+
+- 当前在线主存储为 SQLite，默认路径 `data/app.sqlite3`
+- 可通过环境变量 `APP_DATABASE_FILE` 自定义数据库路径；Docker 默认设置为 `/app/data/app.sqlite3`
+- 应用启动时会自动建库建表，并尝试从旧的 `config.json`、`jsonl/`、`price_history/` 导入一次历史数据
+- `state/`、`prompts/`、`logs/`、`images/` 仍然是文件系统目录，不在 SQLite 中
+- 商品图片会临时落到 `images/task_images_<task_name>/`，任务结束后默认会清理
+- 首次升级完成并确认 `data/app.sqlite3` 中数据正确后，可视部署方式决定是否继续保留旧的 `config.json`、`jsonl/`、`price_history/` 挂载
 
 ### 最少配置
 
@@ -56,7 +69,7 @@ docker compose down
 
 ### 第一次使用
 
-1. 打开 Web UI 并登录。
+1. 打开默认 Web UI `http://127.0.0.1:8000` 并登录。
 2. 进入“闲鱼账号管理”，使用 [Chrome 扩展](https://chromewebstore.google.com/detail/xianyu-login-state-extrac/eidlpfjiodpigmfcahkmlenhppfklcoa) 导出并粘贴闲鱼登录态 JSON。
 3. 登录态文件会保存到 `state/` 目录，例如 `state/acc_1.json`。
 4. 回到“任务管理”，创建任务并绑定账号后即可运行。
@@ -87,7 +100,7 @@ docker compose down
 
 ### 结果查看与运行日志
 
-- 结果页用于浏览命中的商品卡片与详情。
+- 结果页和导出功能现在从 SQLite 查询，不再直接扫描 `jsonl` 文件。
 - 日志页按任务展示运行过程，便于排查登录态失效、风控和 AI 调用问题。
 
 ### 系统设置
@@ -104,7 +117,8 @@ docker compose down
 
 - Python 3.10+
 - Node.js + npm（本地验证 `Node v20.18.3` 可完成前端构建）
-- Playwright 及 Chromium 依赖
+- Playwright CLI 与 Chromium，首次运行前建议执行 `python3 -m pip install playwright && python3 -m playwright install chromium`
+- Chrome / Edge 浏览器（Linux 环境也可使用 Chromium；`start.sh` 会先检查浏览器是否存在）
 
 ```bash
 git clone https://github.com/Usagi-org/ai-goofish-monitor
@@ -119,7 +133,7 @@ chmod +x start.sh
 ./start.sh
 ```
 
-`start.sh` 会自动完成环境检查、依赖安装、前端构建、构建产物复制和后端启动。
+`start.sh` 会先检查 Playwright CLI 和浏览器前置条件；在前置条件满足后自动安装项目依赖、构建前端、复制构建产物并启动后端。
 
 ### 手动启动
 
@@ -135,9 +149,13 @@ npm install
 npm run dev
 ```
 
+- FastAPI 启动时会自动初始化 SQLite，并在首次启动时尝试导入旧的 `config.json/jsonl/price_history`
+- `spider_v2.py` 默认从 SQLite 读取任务；只有显式传入 `--config <path>` 时才会走 JSON 配置兼容模式
+- 默认数据库路径为 `data/app.sqlite3`
 - Vite 开发服务器会将 `/api`、`/auth`、`/ws` 代理到 `http://127.0.0.1:8000`。
 - `npm run build` 先生成 `web-ui/dist/`，`start.sh` 再复制到仓库根目录 `dist/`。
 - FastAPI 负责提供根目录 `dist/index.html` 和 `dist/assets/`。
+- `./start.sh` 默认输出访问地址 `http://localhost:8000` 和 API 文档 `http://localhost:8000/docs`。
 
 ### 测试与校验
 
@@ -170,8 +188,7 @@ cd web-ui && npm run build
 - `PROXY_URL`：为 AI 请求单独指定 HTTP/SOCKS5 代理。
 - `RUN_HEADLESS`：是否以无头模式运行爬虫；Docker 中应保持 `true`。
 - `SERVER_PORT`：后端监听端口，默认 `8000`。
-- `LOGIN_IS_EDGE`：切换登录态提取时使用 Edge 内核。
-- `BROWSER_EXECUTABLE_PATH`：可选，自定义浏览器可执行文件路径（设置后优先于 `LOGIN_IS_EDGE`/`channel`）。
+- `LOGIN_IS_EDGE`：本地环境可切换为 Edge 内核；Docker 镜像未内置 Edge，容器内会固定使用 Chromium。
 - `PCURL_TO_MOBILE`：是否将 PC 商品链接转换为移动端链接。
 
 ### 通知
@@ -223,7 +240,7 @@ graph TD
     F --> G[调用AI进行分析];
     G --> H{AI是否推荐?};
     H -- 是 --> I[发送通知];
-    H -- 否 --> J[保存记录到 JSONL];
+    H -- 否 --> J[保存记录到 SQLite];
     I --> J;
     D -- 否 --> K[翻页/等待];
     K --> C;
@@ -250,6 +267,10 @@ AI 模式会先生成分析标准，再创建任务。现在该流程已改为�
 
 说明根目录 `dist/` 缺失。可直接执行 `./start.sh`，或先在 `web-ui/` 里执行 `npm run build`，再确认构建产物已复制到仓库根目录。
 
+### `./start.sh` 为什么提示缺少 Playwright 或浏览器？
+
+这是脚本的前置检查。请先安装 Playwright CLI 与 Chromium，并确保系统中可用 Chrome / Edge（Linux 环境也可用 Chromium），然后重新执行 `./start.sh`。
+
 </details>
 
 
@@ -273,18 +294,6 @@ AI 模式会先生成分析标准，再创建任务。现在该流程已改为�
 
 </details>
 
-## 体会
-
-<details>
-<summary>点击展开项目体会</summary>
-
-本项目 90%+ 的代码都由AI生成，包括 ISSUE 中涉及的 PR 。
-
-Vibe Coding 的可怕之处在于如果不过多的参与项目建设，对AI生成的代码没有进行细致的review，没有思考过AI为什么这么写，盲目的通过跑测试用例验证功能可用性只会导致项目变成一个黑盒。
-
-同样再用AI对AI生成的代码进行code review时，就像是用AI来验证另一个AI的回答是不是AI，陷入了自我证明的困境之中，所以AI可以辅助分析，但不应该成为真相的仲裁者。
-
-</details>
 
 ## 注意事项
 
@@ -302,3 +311,5 @@ Vibe Coding 的可怕之处在于如果不过多的参与项目建设，对AI生
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=Usagi-org/ai-goofish-monitor&type=Date)](https://www.star-history.com/#Usagi-org/ai-goofish-monitor&Date)
+
+![Alt](https://repobeats.axiom.co/api/embed/b40d8a112271b4bddabadd8fe2635be3c1aa28a3.svg "Repobeats analytics image")

@@ -5,7 +5,6 @@
 
 import asyncio
 import contextlib
-import json
 import os
 import signal
 import sys
@@ -15,9 +14,11 @@ from typing import Awaitable, Callable, Dict, TextIO
 from src.ai_handler import send_ntfy_notification
 from src.config import STATE_FILE
 from src.failure_guard import FailureGuard
+from src.infrastructure.persistence.sqlite_task_repository import find_task_by_name_sync
 from src.utils import build_task_log_path
 
 STOP_TIMEOUT_SECONDS = 20
+SPIDER_DEBUG_LIMIT_ENV = "SPIDER_DEBUG_LIMIT"
 LifecycleHook = Callable[[int], Awaitable[None] | None]
 
 
@@ -53,18 +54,9 @@ class ProcessService:
     def _resolve_cookie_path(self, task_name: str) -> str | None:
         """Best-effort cookie/state path for a task."""
         try:
-            if os.path.exists("config.json"):
-                with open("config.json", "r", encoding="utf-8") as f:
-                    tasks = json.load(f)
-                if isinstance(tasks, list):
-                    for task in tasks:
-                        if not isinstance(task, dict):
-                            continue
-                        if task.get("task_name") != task_name:
-                            continue
-                        state_file = task.get("account_state_file")
-                        if isinstance(state_file, str) and state_file.strip():
-                            return state_file.strip()
+            task = find_task_by_name_sync(task_name)
+            if task and isinstance(task.account_state_file, str) and task.account_state_file.strip():
+                return task.account_state_file.strip()
         except Exception:
             pass
 
@@ -94,6 +86,19 @@ class ProcessService:
         log_file_handle = open(log_file_path, "a", encoding="utf-8")
         return log_file_path, log_file_handle
 
+    def _build_spawn_command(self, task_name: str) -> list[str]:
+        command = [
+            sys.executable,
+            "-u",
+            "spider_v2.py",
+            "--task-name",
+            task_name,
+        ]
+        debug_limit = str(os.getenv(SPIDER_DEBUG_LIMIT_ENV, "")).strip()
+        if debug_limit.isdigit() and int(debug_limit) > 0:
+            command.extend(["--debug-limit", debug_limit])
+        return command
+
     async def _spawn_process(
         self,
         task_name: str,
@@ -104,11 +109,7 @@ class ProcessService:
         child_env["PYTHONIOENCODING"] = "utf-8"
         child_env["PYTHONUTF8"] = "1"
         return await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-u",
-            "spider_v2.py",
-            "--task-name",
-            task_name,
+            *self._build_spawn_command(task_name),
             stdout=log_file_handle,
             stderr=log_file_handle,
             preexec_fn=preexec_fn,

@@ -21,7 +21,7 @@ def test_task_can_start_and_stop():
     assert task.can_start() is True
     assert task.can_stop() is False
 
-    running = task.copy(update={"is_running": True})
+    running = task.model_copy(update={"is_running": True})
     assert running.can_start() is False
     assert running.can_stop() is True
 
@@ -95,3 +95,31 @@ def test_generate_request_enables_image_analysis_by_default():
         decision_mode="ai",
     )
     assert req.analyze_images is True
+
+
+def test_generate_request_infers_fixed_account_strategy_from_state_file():
+    req = TaskGenerateRequest(
+        task_name="Sony A7M4",
+        keyword="sony a7m4",
+        description="只看机身成色和卖家信用。",
+        decision_mode="ai",
+        account_state_file="state/acc_1.json",
+    )
+
+    assert req.account_strategy == "fixed"
+
+
+def test_generate_request_requires_state_file_for_fixed_account_strategy():
+    try:
+        TaskGenerateRequest(
+            task_name="Sony A7M4",
+            keyword="sony a7m4",
+            description="只看机身成色和卖家信用。",
+            decision_mode="ai",
+            account_strategy="fixed",
+        )
+    except ValueError as exc:
+        assert "固定账号模式下必须选择账号" in str(exc)
+        return
+
+    raise AssertionError("固定账号模式应要求 account_state_file")

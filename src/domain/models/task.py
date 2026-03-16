@@ -4,14 +4,20 @@
 """
 import re
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, List, Literal, Optional
 
 from apscheduler.triggers.cron import CronTrigger
-from pydantic import BaseModel, Field, root_validator, validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from src.services.account_strategy_service import (
+    clean_account_state_file,
+    normalize_account_strategy,
+)
 
 
 class TaskStatus(str, Enum):
     """任务状态枚举"""
+
     STOPPED = "stopped"
     RUNNING = "running"
     SCHEDULED = "scheduled"
@@ -58,16 +64,21 @@ def _extract_keywords_from_legacy_groups(groups) -> List[str]:
     return _normalize_keyword_values(merged)
 
 
-def _normalize_payload_keywords(payload: dict) -> dict:
-    if payload is None:
-        return {}
+def _normalize_payload_keywords(payload: Any) -> Any:
+    if payload is None or not isinstance(payload, dict):
+        return payload
     values = dict(payload)
+    values["account_state_file"] = clean_account_state_file(values.get("account_state_file"))
+    values["account_strategy"] = normalize_account_strategy(
+        values.get("account_strategy"),
+        values.get("account_state_file"),
+    )
     if "keyword_rules" in values:
-        keyword_rules = values.get("keyword_rules")
-        values["keyword_rules"] = _normalize_keyword_values(keyword_rules)
+        values["keyword_rules"] = _normalize_keyword_values(values.get("keyword_rules"))
     elif "keyword_rule_groups" in values:
-        legacy_groups = values.get("keyword_rule_groups")
-        values["keyword_rules"] = _extract_keywords_from_legacy_groups(legacy_groups)
+        values["keyword_rules"] = _extract_keywords_from_legacy_groups(
+            values.get("keyword_rule_groups")
+        )
     return values
 
 
@@ -81,40 +92,6 @@ def _normalize_optional_string(value):
     return value
 
 
-def _normalize_hooks(value) -> Dict[str, List[str]]:
-    if not isinstance(value, dict):
-        return {}
-
-    normalized: Dict[str, List[str]] = {}
-    for stage, handlers in value.items():
-        stage_name = str(stage).strip()
-        if not stage_name:
-            continue
-
-        if isinstance(handlers, (list, tuple, set)):
-            raw_handlers = handlers
-        else:
-            raw_handlers = [handlers]
-
-        normalized_handlers: List[str] = []
-        for handler in raw_handlers:
-            handler_text = str(handler).strip()
-            if not handler_text:
-                continue
-            normalized_handlers.append(handler_text)
-
-        if normalized_handlers:
-            normalized[stage_name] = normalized_handlers
-
-    return normalized
-
-
-def _normalize_hook_params(value) -> Dict[str, Any]:
-    if not isinstance(value, dict):
-        return {}
-    return dict(value)
-
-
 def _validate_cron_expression(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
@@ -125,8 +102,19 @@ def _validate_cron_expression(value: Optional[str]) -> Optional[str]:
     return value
 
 
+def _normalize_price_value(value):
+    if _normalize_optional_string(value) is None:
+        return None
+    if isinstance(value, (int, float)):
+        return str(value)
+    return value
+
+
 class Task(BaseModel):
     """任务实体"""
+
+    model_config = ConfigDict(use_enum_values=True, extra="ignore")
+
     id: Optional[int] = None
     task_name: str
     enabled: bool
@@ -141,34 +129,23 @@ class Task(BaseModel):
     ai_prompt_base_file: str
     ai_prompt_criteria_file: str
     account_state_file: Optional[str] = None
+    account_strategy: Literal["auto", "fixed", "rotate"] = "auto"
     free_shipping: bool = True
     new_publish_option: Optional[str] = None
     region: Optional[str] = None
     decision_mode: Literal["ai", "keyword"] = "ai"
     keyword_rules: List[str] = Field(default_factory=list)
-    hooks: Dict[str, List[str]] = Field(default_factory=dict)
-    hook_params: Dict[str, Any] = Field(default_factory=dict)
     is_running: bool = False
 
-    class Config:
-        use_enum_values = True
-        extra = "ignore"
-
-    @root_validator(pre=True)
+    @model_validator(mode="before")
+    @classmethod
     def normalize_legacy_keyword_payload(cls, values):
         return _normalize_payload_keywords(values)
 
-    @validator("keyword_rules", pre=True)
-    def normalize_keyword_rules(cls, v):
-        return _normalize_keyword_values(v)
-
-    @validator("hooks", pre=True)
-    def normalize_hooks(cls, v):
-        return _normalize_hooks(v)
-
-    @validator("hook_params", pre=True)
-    def normalize_hook_params(cls, v):
-        return _normalize_hook_params(v)
+    @field_validator("keyword_rules", mode="before")
+    @classmethod
+    def normalize_keyword_rules(cls, value):
+        return _normalize_keyword_values(value)
 
     def can_start(self) -> bool:
         """检查任务是否可以启动"""
@@ -180,12 +157,15 @@ class Task(BaseModel):
 
     def apply_update(self, update: "TaskUpdate") -> "Task":
         """应用更新并返回新的任务实例"""
-        update_data = update.dict(exclude_unset=True)
-        return self.copy(update=update_data)
+        update_data = update.model_dump(exclude_unset=True)
+        return self.model_copy(update=update_data)
 
 
 class TaskCreate(BaseModel):
     """创建任务的DTO"""
+
+    model_config = ConfigDict(extra="ignore")
+
     task_name: str
     enabled: bool = True
     keyword: str
@@ -199,65 +179,60 @@ class TaskCreate(BaseModel):
     ai_prompt_base_file: str = "prompts/base_prompt.txt"
     ai_prompt_criteria_file: str = ""
     account_state_file: Optional[str] = None
+    account_strategy: Literal["auto", "fixed", "rotate"] = "auto"
     free_shipping: bool = True
     new_publish_option: Optional[str] = None
     region: Optional[str] = None
     decision_mode: Literal["ai", "keyword"] = "ai"
     keyword_rules: List[str] = Field(default_factory=list)
-    hooks: Dict[str, List[str]] = Field(default_factory=dict)
-    hook_params: Dict[str, Any] = Field(default_factory=dict)
 
-    class Config:
-        extra = "ignore"
-
-    @root_validator(pre=True)
+    @model_validator(mode="before")
+    @classmethod
     def normalize_legacy_keyword_payload(cls, values):
         return _normalize_payload_keywords(values)
 
-    @validator("min_price", "max_price", pre=True)
-    def convert_price_to_str(cls, v):
-        """将价格转换为字符串，处理空字符串和数字"""
-        if _normalize_optional_string(v) is None:
-            return None
-        if isinstance(v, (int, float)):
-            return str(v)
-        return v
+    @field_validator("min_price", "max_price", mode="before")
+    @classmethod
+    def convert_price_to_str(cls, value):
+        return _normalize_price_value(value)
 
-    @validator("cron", pre=True)
-    def normalize_cron(cls, v):
-        return _normalize_optional_string(v)
+    @field_validator("cron", mode="before")
+    @classmethod
+    def normalize_cron(cls, value):
+        return _normalize_optional_string(value)
 
-    @validator("cron")
-    def validate_cron(cls, v):
-        return _validate_cron_expression(v)
+    @field_validator("account_state_file", mode="before")
+    @classmethod
+    def normalize_account_state_file(cls, value):
+        return clean_account_state_file(value)
 
-    @validator("keyword_rules", pre=True)
-    def normalize_keyword_rules(cls, v):
-        return _normalize_keyword_values(v)
+    @field_validator("cron")
+    @classmethod
+    def validate_cron(cls, value):
+        return _validate_cron_expression(value)
 
-    @validator("hooks", pre=True)
-    def normalize_hooks(cls, v):
-        return _normalize_hooks(v)
+    @field_validator("keyword_rules", mode="before")
+    @classmethod
+    def normalize_keyword_rules(cls, value):
+        return _normalize_keyword_values(value)
 
-    @validator("hook_params", pre=True)
-    def normalize_hook_params(cls, v):
-        return _normalize_hook_params(v)
-
-    @root_validator(skip_on_failure=True)
-    def validate_decision_mode_payload(cls, values):
-        mode = (values.get("decision_mode") or "ai").lower()
-        description = str(values.get("description") or "").strip()
-        keyword_rules = values.get("keyword_rules") or []
-
-        if mode == "ai" and not description:
+    @model_validator(mode="after")
+    def validate_decision_mode_payload(self):
+        description = str(self.description or "").strip()
+        if self.decision_mode == "ai" and not description:
             raise ValueError("AI 判断模式下，详细需求(description)不能为空。")
-        if mode == "keyword" and not _has_keyword_rules(keyword_rules):
+        if self.decision_mode == "keyword" and not _has_keyword_rules(self.keyword_rules):
             raise ValueError("关键词判断模式下，至少需要一个关键词。")
-        return values
+        if self.account_strategy == "fixed" and not self.account_state_file:
+            raise ValueError("固定账号模式下必须选择账号。")
+        return self
 
 
 class TaskUpdate(BaseModel):
     """更新任务的DTO"""
+
+    model_config = ConfigDict(extra="ignore")
+
     task_name: Optional[str] = None
     enabled: Optional[bool] = None
     keyword: Optional[str] = None
@@ -271,70 +246,60 @@ class TaskUpdate(BaseModel):
     ai_prompt_base_file: Optional[str] = None
     ai_prompt_criteria_file: Optional[str] = None
     account_state_file: Optional[str] = None
+    account_strategy: Optional[Literal["auto", "fixed", "rotate"]] = None
     free_shipping: Optional[bool] = None
     new_publish_option: Optional[str] = None
     region: Optional[str] = None
     decision_mode: Optional[Literal["ai", "keyword"]] = None
     keyword_rules: Optional[List[str]] = None
-    hooks: Optional[Dict[str, List[str]]] = None
-    hook_params: Optional[Dict[str, Any]] = None
     is_running: Optional[bool] = None
 
-    class Config:
-        extra = "ignore"
-
-    @root_validator(pre=True)
+    @model_validator(mode="before")
+    @classmethod
     def normalize_legacy_keyword_payload(cls, values):
         return _normalize_payload_keywords(values)
 
-    @validator("min_price", "max_price", pre=True)
-    def convert_price_to_str(cls, v):
-        """将价格转换为字符串，处理空字符串和数字"""
-        if _normalize_optional_string(v) is None:
-            return None
-        if isinstance(v, (int, float)):
-            return str(v)
-        return v
+    @field_validator("min_price", "max_price", mode="before")
+    @classmethod
+    def convert_price_to_str(cls, value):
+        return _normalize_price_value(value)
 
-    @validator("cron", pre=True)
-    def normalize_cron(cls, v):
-        return _normalize_optional_string(v)
+    @field_validator("cron", mode="before")
+    @classmethod
+    def normalize_cron(cls, value):
+        return _normalize_optional_string(value)
 
-    @validator("cron")
-    def validate_cron(cls, v):
-        return _validate_cron_expression(v)
+    @field_validator("account_state_file", mode="before")
+    @classmethod
+    def normalize_account_state_file(cls, value):
+        return clean_account_state_file(value)
 
-    @validator("keyword_rules", pre=True)
-    def normalize_keyword_rules(cls, v):
-        return _normalize_keyword_values(v)
+    @field_validator("cron")
+    @classmethod
+    def validate_cron(cls, value):
+        return _validate_cron_expression(value)
 
-    @validator("hooks", pre=True)
-    def normalize_hooks(cls, v):
-        if v is None:
-            return None
-        return _normalize_hooks(v)
+    @field_validator("keyword_rules", mode="before")
+    @classmethod
+    def normalize_keyword_rules(cls, value):
+        return _normalize_keyword_values(value)
 
-    @validator("hook_params", pre=True)
-    def normalize_hook_params(cls, v):
-        if v is None:
-            return None
-        return _normalize_hook_params(v)
-
-    @root_validator(skip_on_failure=True)
-    def validate_partial_keyword_payload(cls, values):
-        mode = values.get("decision_mode")
-        rules = values.get("keyword_rules")
-        description = values.get("description")
-
-        if mode == "keyword" and rules is not None and not _has_keyword_rules(rules):
-            raise ValueError("关键词判断模式下，至少需要一个关键词。")
-        if mode == "ai" and description is not None and not str(description).strip():
-            raise ValueError("AI 判断模式下，详细需求(description)不能为空。")
-        return values
+    @model_validator(mode="after")
+    def validate_partial_keyword_payload(self):
+        if self.decision_mode == "keyword" and self.keyword_rules is not None:
+            if not _has_keyword_rules(self.keyword_rules):
+                raise ValueError("关键词判断模式下，至少需要一个关键词。")
+        if self.decision_mode == "ai" and self.description is not None:
+            if not str(self.description).strip():
+                raise ValueError("AI 判断模式下，详细需求(description)不能为空。")
+        return self
 
 
 class TaskGenerateRequest(BaseModel):
     """任务创建请求DTO（AI模式支持自动生成标准）"""
+
+    model_config = ConfigDict(extra="ignore")
+
     task_name: str
     keyword: str
     description: Optional[str] = ""
@@ -345,57 +310,55 @@ class TaskGenerateRequest(BaseModel):
     max_pages: int = 3
     cron: Optional[str] = None
     account_state_file: Optional[str] = None
+    account_strategy: Literal["auto", "fixed", "rotate"] = "auto"
     free_shipping: bool = True
     new_publish_option: Optional[str] = None
     region: Optional[str] = None
     decision_mode: Literal["ai", "keyword"] = "ai"
     keyword_rules: List[str] = Field(default_factory=list)
 
-    class Config:
-        extra = "ignore"
-
-    @root_validator(pre=True)
+    @model_validator(mode="before")
+    @classmethod
     def normalize_legacy_keyword_payload(cls, values):
         return _normalize_payload_keywords(values)
 
-    @validator("min_price", "max_price", pre=True)
-    def convert_price_to_str(cls, v):
-        """将价格转换为字符串，处理空字符串和数字"""
-        if _normalize_optional_string(v) is None:
-            return None
-        if isinstance(v, (int, float)):
-            return str(v)
-        return v
+    @field_validator("min_price", "max_price", mode="before")
+    @classmethod
+    def convert_price_to_str(cls, value):
+        return _normalize_price_value(value)
 
-    @validator("cron", pre=True)
-    def empty_str_to_none(cls, v):
-        """将空字符串转换为 None"""
-        return _normalize_optional_string(v)
+    @field_validator("cron", mode="before")
+    @classmethod
+    def empty_str_to_none(cls, value):
+        return _normalize_optional_string(value)
 
-    @validator("cron")
-    def validate_cron(cls, v):
-        return _validate_cron_expression(v)
+    @field_validator("cron")
+    @classmethod
+    def validate_cron(cls, value):
+        return _validate_cron_expression(value)
 
-    @validator("account_state_file", pre=True)
-    def empty_account_to_none(cls, v):
-        return _normalize_optional_string(v)
+    @field_validator("account_state_file", mode="before")
+    @classmethod
+    def empty_account_to_none(cls, value):
+        return _normalize_optional_string(value)
 
-    @validator("new_publish_option", "region", pre=True)
-    def empty_str_to_none_for_strings(cls, v):
-        return _normalize_optional_string(v)
+    @field_validator("new_publish_option", "region", mode="before")
+    @classmethod
+    def empty_str_to_none_for_strings(cls, value):
+        return _normalize_optional_string(value)
 
-    @validator("keyword_rules", pre=True)
-    def normalize_keyword_rules(cls, v):
-        return _normalize_keyword_values(v)
+    @field_validator("keyword_rules", mode="before")
+    @classmethod
+    def normalize_keyword_rules(cls, value):
+        return _normalize_keyword_values(value)
 
-    @root_validator(skip_on_failure=True)
-    def validate_decision_mode_payload(cls, values):
-        mode = (values.get("decision_mode") or "ai").lower()
-        description = str(values.get("description") or "").strip()
-        keyword_rules = values.get("keyword_rules") or []
-
-        if mode == "ai" and not description:
+    @model_validator(mode="after")
+    def validate_decision_mode_payload(self):
+        description = str(self.description or "").strip()
+        if self.decision_mode == "ai" and not description:
             raise ValueError("AI 判断模式下，详细需求(description)不能为空。")
-        if mode == "keyword" and not _has_keyword_rules(keyword_rules):
+        if self.decision_mode == "keyword" and not _has_keyword_rules(self.keyword_rules):
             raise ValueError("关键词判断模式下，至少需要一个关键词。")
-        return values
+        if self.account_strategy == "fixed" and not self.account_state_file:
+            raise ValueError("固定账号模式下必须选择账号。")
+        return self
