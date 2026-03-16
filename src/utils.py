@@ -9,7 +9,7 @@ from datetime import datetime
 from functools import wraps
 from urllib.parse import quote
 
-from openai import APIStatusError
+from httpx import HTTPStatusError
 from requests.exceptions import HTTPError
 
 
@@ -23,7 +23,7 @@ def retry_on_failure(retries=3, delay=5):
             for i in range(retries):
                 try:
                     return await func(*args, **kwargs)
-                except (APIStatusError, HTTPError) as e:
+                except (HTTPStatusError, HTTPError) as e:
                     print(f"函数 {func.__name__} 第 {i + 1}/{retries} 次尝试失败，发生HTTP错误。")
                     if hasattr(e, 'status_code'):
                         print(f"  - 状态码 (Status Code): {e.status_code}")

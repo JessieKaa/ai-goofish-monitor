@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import traceback
 from typing import Awaitable, Callable, Optional
 
 import aiofiles
@@ -78,22 +79,13 @@ async def generate_criteria(
 
     await _report_progress(progress_callback, "llm", "正在调用 AI 生成分析标准。")
     print("正在调用AI生成新的分析标准，请稍候...")
+    request_messages = [{"role": "user", "content": prompt}]
     try:
-        request_params = {
-            "model": ai_client.settings.model_name,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.5,
-        }
-        if ai_client.settings.enable_thinking:
-            request_params["extra_body"] = {"enable_thinking": False}
-
-        response = await ai_client.client.chat.completions.create(**request_params)
-        # 兼容不同API响应格式，检查response是否为字符串
-        if hasattr(response, 'choices'):
-            generated_text = response.choices[0].message.content
-        else:
-            # 如果response是字符串，则直接使用
-            generated_text = response
+        generated_text = await ai_client._call_ai(
+            messages=request_messages,
+            temperature=0.5,
+            max_tokens=4000,
+        )
         print("AI已成功生成内容。")
         
         # 处理content可能为None或空字符串的情况
@@ -102,7 +94,38 @@ async def generate_criteria(
         
         return generated_text.strip()
     except Exception as e:
+        safe_base_url = getattr(ai_client, "base_url", "") or "(empty)"
+        model_name = getattr(ai_client.settings, "model_name", "") if ai_client.settings else "(unknown)"
+        enable_response_format = (
+            getattr(ai_client.settings, "enable_response_format", None)
+            if ai_client.settings
+            else None
+        )
+        enable_thinking = (
+            getattr(ai_client.settings, "enable_thinking", None)
+            if ai_client.settings
+            else None
+        )
+        user_prompt_preview = prompt[:300].replace("\n", "\\n")
+
         print(f"调用 OpenAI API 时出错: {e}")
+        print(f"[AI错误排查] 异常类型: {type(e).__name__}")
+        print(f"[AI错误排查] 异常repr: {repr(e)}")
+        print(f"[AI错误排查] 异常args: {getattr(e, 'args', ())}")
+        print(f"[AI错误排查] model={model_name}, base_url={safe_base_url}")
+        print(
+            "[AI错误排查] payload摘要: "
+            f"messages={len(request_messages)}, "
+            f"user_prompt_len={len(prompt)}, "
+            f"user_prompt_preview={user_prompt_preview}"
+        )
+        print(
+            "[AI错误排查] 选项: "
+            f"enable_response_format={enable_response_format}, "
+            f"enable_thinking={enable_thinking}"
+        )
+        print("[AI错误排查] traceback:")
+        print(traceback.format_exc())
         raise e
 
 

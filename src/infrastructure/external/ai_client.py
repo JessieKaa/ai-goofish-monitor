@@ -6,9 +6,8 @@ import os
 import json
 import base64
 from typing import Dict, List, Optional
-from datetime import datetime
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+import httpx
 from src.ai_message_builder import (
     build_analysis_text_prompt,
     build_user_message_content,
@@ -22,7 +21,7 @@ class AIClient:
 
     def __init__(self):
         self.settings: Optional[AISettings] = None
-        self.client: Optional[AsyncOpenAI] = None
+        self.base_url: str = ""
         self.refresh()
 
     def _load_settings(self) -> None:
@@ -31,31 +30,18 @@ class AIClient:
 
     def refresh(self) -> None:
         self._load_settings()
-        self.client = self._initialize_client()
+        self.base_url = self._initialize_base_url()
 
-    def _initialize_client(self) -> Optional[AsyncOpenAI]:
-        """初始化 OpenAI 客户端"""
+    def _initialize_base_url(self) -> str:
+        """初始化 AI 请求基础地址"""
         if not self.settings or not self.settings.is_configured():
             print("警告：AI 配置不完整，AI 功能将不可用")
-            return None
-
-        try:
-            if self.settings.proxy_url:
-                print(f"正在为 AI 请求使用代理: {self.settings.proxy_url}")
-                os.environ['HTTP_PROXY'] = self.settings.proxy_url
-                os.environ['HTTPS_PROXY'] = self.settings.proxy_url
-
-            return AsyncOpenAI(
-                api_key=self.settings.api_key,
-                base_url=self.settings.base_url
-            )
-        except Exception as e:
-            print(f"初始化 AI 客户端失败: {e}")
-            return None
+            return ""
+        return (self.settings.base_url or "").strip().rstrip("/")
 
     def is_available(self) -> bool:
         """检查 AI 客户端是否可用"""
-        return self.client is not None
+        return bool(self.settings and self.settings.is_configured() and self.base_url)
 
     @staticmethod
     def encode_image(image_path: str) -> Optional[str]:
@@ -115,13 +101,18 @@ class AIClient:
         user_content = build_user_message_content(text_prompt, image_data_urls)
         return [{"role": "user", "content": user_content}]
 
-    async def _call_ai(self, messages: List[Dict]) -> str:
+    async def _call_ai(
+        self,
+        messages: List[Dict],
+        temperature: float = 0.1,
+        max_tokens: int = 4000,
+    ) -> str:
         """调用 AI API"""
         request_params = {
             "model": self.settings.model_name,
             "messages": messages,
-            "temperature": 0.1,
-            "max_tokens": 4000
+            "temperature": temperature,
+            "max_tokens": max_tokens
         }
 
         # 根据配置添加可选参数
@@ -129,14 +120,27 @@ class AIClient:
             request_params["response_format"] = {"type": "json_object"}
 
         if self.settings.enable_thinking:
-            request_params["extra_body"] = {"enable_thinking": False}
+            request_params["enable_thinking"] = False
 
-        response = await self.client.chat.completions.create(**request_params)
-
-        # 兼容不同 API 响应格式
-        if hasattr(response, 'choices'):
-            return response.choices[0].message.content
-        return response
+        headers = {"Content-Type": "application/json"}
+        if self.settings.api_key:
+            headers["Authorization"] = f"Bearer {self.settings.api_key}"
+        proxy = (self.settings.proxy_url or "").strip() or None
+        url = f"{self.base_url}/chat/completions"
+        async with httpx.AsyncClient(
+            timeout=360.0,
+            proxy=proxy,
+            trust_env=False,
+            http2=False,
+        ) as client:
+            resp = await client.post(url, headers=headers, json=request_params)
+            resp.raise_for_status()
+            result = resp.json()
+            return (
+                result.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
 
     def _parse_response(self, response_text: str) -> Optional[Dict]:
         """解析 AI 响应"""

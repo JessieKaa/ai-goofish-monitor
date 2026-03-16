@@ -1,1 +1,56 @@
-[]
+[
+  {
+    "task_name": "intel arc b580显卡",
+    "enabled": true,
+    "keyword": "b580显卡",
+    "description": "intel arc b580显卡 12GB显存，描述真实，功能完好无维修。三风扇价格1550以下，双风扇价格1450以下",
+    "analyze_images": true,
+    "max_pages": 5,
+    "personal_only": true,
+    "min_price": "1000",
+    "max_price": "1550",
+    "cron": null,
+    "ai_prompt_base_file": "prompts/base_prompt.txt",
+    "ai_prompt_criteria_file": "prompts/b580显卡_criteria.txt",
+    "account_state_file": null,
+    "free_shipping": true,
+    "new_publish_option": "3天内",
+    "region": "全国",
+    "decision_mode": "ai",
+    "keyword_rules": [],
+    "hooks": {},
+    "hook_params": {},
+    "is_running": false
+  },
+  {
+    "task_name": "rtx3080显卡",
+    "enabled": true,
+    "keyword": "rtx3080显卡",
+    "description": "个人卖家自用，非矿卡，功能完好，卖家信用优秀以上。邮寄或者深圳南山宝安自提。",
+    "analyze_images": true,
+    "max_pages": 3,
+    "personal_only": true,
+    "min_price": "1500",
+    "max_price": "2500",
+    "cron": null,
+    "ai_prompt_base_file": "prompts/base_prompt.txt",
+    "ai_prompt_criteria_file": "prompts/rtx3080显卡_criteria.txt",
+    "account_state_file": null,
+    "free_shipping": false,
+    "new_publish_option": "最新",
+    "region": "全国",
+    "decision_mode": "ai",
+    "keyword_rules": [],
+    "hooks": {
+      "before_seller_profile": [
+        "src.hooks.item_hooks:ai_gate_before_seller_profile"
+      ]
+    },
+    "hook_params": {
+      "pre_seller_ai_prompt_file": "prompts/pre_seller_gate_prompt.txt",
+      "pre_seller_ai_fail_open": true,
+      "pre_seller_ai_default_action": "skip_item"
+    },
+    "is_running": true
+  }
+]

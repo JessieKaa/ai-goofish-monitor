@@ -140,6 +140,33 @@ def test_update_task_rejects_invalid_cron_expression(api_client, sample_task_pay
     assert task_response.json()["cron"] == sample_task_payload["cron"]
 
 
+def test_update_task_keeps_hooks_config(api_client, api_context, sample_task_payload):
+    payload = dict(sample_task_payload)
+    payload["hooks"] = {
+        "before_seller_profile": [
+            "src.hooks.item_hooks:ai_gate_before_seller_profile",
+        ]
+    }
+    payload["hook_params"] = {
+        "pre_seller_ai_prompt_file": "prompts/pre_seller_gate_prompt.txt",
+        "pre_seller_ai_fail_open": True,
+        "pre_seller_ai_default_action": "skip_item",
+    }
+
+    create_response = api_client.post("/api/tasks/", json=payload)
+    assert create_response.status_code == 200
+
+    patch_response = api_client.patch("/api/tasks/0", json={"enabled": False})
+    assert patch_response.status_code == 200
+    updated_task = patch_response.json()["task"]
+    assert updated_task["hooks"] == payload["hooks"]
+    assert updated_task["hook_params"] == payload["hook_params"]
+
+    stored = api_context["config_file"].read_text(encoding="utf-8")
+    assert "before_seller_profile" in stored
+    assert "pre_seller_ai_prompt_file" in stored
+
+
 def test_delete_task_stops_runtime_and_reindexes_process_state(
     api_client,
     api_context,

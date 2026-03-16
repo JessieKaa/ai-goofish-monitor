@@ -4,7 +4,7 @@
 """
 import re
 from enum import Enum
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from apscheduler.triggers.cron import CronTrigger
 from pydantic import BaseModel, Field, root_validator, validator
@@ -81,6 +81,40 @@ def _normalize_optional_string(value):
     return value
 
 
+def _normalize_hooks(value) -> Dict[str, List[str]]:
+    if not isinstance(value, dict):
+        return {}
+
+    normalized: Dict[str, List[str]] = {}
+    for stage, handlers in value.items():
+        stage_name = str(stage).strip()
+        if not stage_name:
+            continue
+
+        if isinstance(handlers, (list, tuple, set)):
+            raw_handlers = handlers
+        else:
+            raw_handlers = [handlers]
+
+        normalized_handlers: List[str] = []
+        for handler in raw_handlers:
+            handler_text = str(handler).strip()
+            if not handler_text:
+                continue
+            normalized_handlers.append(handler_text)
+
+        if normalized_handlers:
+            normalized[stage_name] = normalized_handlers
+
+    return normalized
+
+
+def _normalize_hook_params(value) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return dict(value)
+
+
 def _validate_cron_expression(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
@@ -112,6 +146,8 @@ class Task(BaseModel):
     region: Optional[str] = None
     decision_mode: Literal["ai", "keyword"] = "ai"
     keyword_rules: List[str] = Field(default_factory=list)
+    hooks: Dict[str, List[str]] = Field(default_factory=dict)
+    hook_params: Dict[str, Any] = Field(default_factory=dict)
     is_running: bool = False
 
     class Config:
@@ -125,6 +161,14 @@ class Task(BaseModel):
     @validator("keyword_rules", pre=True)
     def normalize_keyword_rules(cls, v):
         return _normalize_keyword_values(v)
+
+    @validator("hooks", pre=True)
+    def normalize_hooks(cls, v):
+        return _normalize_hooks(v)
+
+    @validator("hook_params", pre=True)
+    def normalize_hook_params(cls, v):
+        return _normalize_hook_params(v)
 
     def can_start(self) -> bool:
         """检查任务是否可以启动"""
@@ -160,6 +204,8 @@ class TaskCreate(BaseModel):
     region: Optional[str] = None
     decision_mode: Literal["ai", "keyword"] = "ai"
     keyword_rules: List[str] = Field(default_factory=list)
+    hooks: Dict[str, List[str]] = Field(default_factory=dict)
+    hook_params: Dict[str, Any] = Field(default_factory=dict)
 
     class Config:
         extra = "ignore"
@@ -188,6 +234,14 @@ class TaskCreate(BaseModel):
     @validator("keyword_rules", pre=True)
     def normalize_keyword_rules(cls, v):
         return _normalize_keyword_values(v)
+
+    @validator("hooks", pre=True)
+    def normalize_hooks(cls, v):
+        return _normalize_hooks(v)
+
+    @validator("hook_params", pre=True)
+    def normalize_hook_params(cls, v):
+        return _normalize_hook_params(v)
 
     @root_validator(skip_on_failure=True)
     def validate_decision_mode_payload(cls, values):
@@ -222,6 +276,8 @@ class TaskUpdate(BaseModel):
     region: Optional[str] = None
     decision_mode: Optional[Literal["ai", "keyword"]] = None
     keyword_rules: Optional[List[str]] = None
+    hooks: Optional[Dict[str, List[str]]] = None
+    hook_params: Optional[Dict[str, Any]] = None
     is_running: Optional[bool] = None
 
     class Config:
@@ -251,6 +307,18 @@ class TaskUpdate(BaseModel):
     @validator("keyword_rules", pre=True)
     def normalize_keyword_rules(cls, v):
         return _normalize_keyword_values(v)
+
+    @validator("hooks", pre=True)
+    def normalize_hooks(cls, v):
+        if v is None:
+            return None
+        return _normalize_hooks(v)
+
+    @validator("hook_params", pre=True)
+    def normalize_hook_params(cls, v):
+        if v is None:
+            return None
+        return _normalize_hook_params(v)
 
     @root_validator(skip_on_failure=True)
     def validate_partial_keyword_payload(cls, values):

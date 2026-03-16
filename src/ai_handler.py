@@ -37,7 +37,9 @@ from src.config import (
     WEBHOOK_QUERY_PARAMETERS,
     WEBHOOK_BODY,
     ENABLE_RESPONSE_FORMAT,
-    client,
+    AI_API_READY,
+    ai_chat_completions,
+    get_ai_request_params,
 )
 from src.ai_message_builder import (
     build_analysis_text_prompt,
@@ -516,7 +518,7 @@ async def send_ntfy_notification(product_data, reason):
 @retry_on_failure(retries=3, delay=5)
 async def get_ai_analysis(product_data, image_paths=None, prompt_text=""):
     """将完整的商品JSON数据和所有图片发送给 AI 进行分析（异步）。"""
-    if not client:
+    if not AI_API_READY:
         safe_print("   [AI分析] 错误：AI客户端未初始化，跳过分析。")
         return None
 
@@ -594,8 +596,6 @@ async def get_ai_analysis(product_data, image_paths=None, prompt_text=""):
             # 根据重试次数调整参数
             current_temperature = 0.1 if attempt == 0 else 0.05  # 重试时使用更低的温度
 
-            from src.config import get_ai_request_params
-            
             # 构建请求参数，根据ENABLE_RESPONSE_FORMAT决定是否使用response_format
             request_params = {
                 "model": MODEL_NAME,
@@ -608,16 +608,17 @@ async def get_ai_analysis(product_data, image_paths=None, prompt_text=""):
             if ENABLE_RESPONSE_FORMAT:
                 request_params["response_format"] = {"type": "json_object"}
             
-            response = await client.chat.completions.create(
-                **get_ai_request_params(**request_params)
-            )
+            response = await ai_chat_completions(get_ai_request_params(**request_params))
 
             # 兼容不同API响应格式，检查response是否为字符串
-            if hasattr(response, 'choices'):
-                ai_response_content = response.choices[0].message.content
+            if isinstance(response, dict):
+                ai_response_content = (
+                    response.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                )
             else:
-                # 如果response是字符串，则直接使用
-                ai_response_content = response
+                ai_response_content = str(response)
 
             if AI_DEBUG_MODE:
                 safe_print(f"\n--- [AI DEBUG] 第{attempt + 1}次尝试 ---")

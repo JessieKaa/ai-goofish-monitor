@@ -54,6 +54,7 @@ docker compose -f docker-compose.dev.yaml up -d --build
     本项目在本地运行时默认通过 `channel="chrome"` 调用您系统中已安装的 **Google Chrome** 或 **Microsoft Edge**。
     
     - 请确保您的电脑已安装其中之一。
+    - 如需指定浏览器位置，可在 `.env` 中设置 `BROWSER_EXECUTABLE_PATH`（优先于默认 channel）。
     - **无需** 运行 `playwright install` 下载额外的浏览器内核。
 
 ### 第二步：编译前端 (Vue3 + Shadcn UI)

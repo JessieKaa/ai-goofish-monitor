@@ -1,8 +1,9 @@
 import os
 import sys
+from typing import Any, Dict
 
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+import httpx
 
 # --- AI & Notification Configuration ---
 load_dotenv()
@@ -42,10 +43,12 @@ PCURL_TO_MOBILE = os.getenv("PCURL_TO_MOBILE", "false").lower() == "true"
 RUN_HEADLESS = os.getenv("RUN_HEADLESS", "true").lower() != "false"
 LOGIN_IS_EDGE = os.getenv("LOGIN_IS_EDGE", "false").lower() == "true"
 RUNNING_IN_DOCKER = os.getenv("RUNNING_IN_DOCKER", "false").lower() == "true"
+BROWSER_EXECUTABLE_PATH = (os.getenv("BROWSER_EXECUTABLE_PATH") or "").strip()
 AI_DEBUG_MODE = os.getenv("AI_DEBUG_MODE", "false").lower() == "true"
 SKIP_AI_ANALYSIS = os.getenv("SKIP_AI_ANALYSIS", "false").lower() == "true"
 ENABLE_THINKING = os.getenv("ENABLE_THINKING", "false").lower() == "true"
 ENABLE_RESPONSE_FORMAT = os.getenv("ENABLE_RESPONSE_FORMAT", "true").lower() == "true"
+AI_API_READY = bool(BASE_URL and MODEL_NAME)
 
 # --- Headers ---
 IMAGE_DOWNLOAD_HEADERS = {
@@ -58,29 +61,8 @@ IMAGE_DOWNLOAD_HEADERS = {
 
 # --- Client Initialization ---
 # 检查配置是否齐全
-if not all([BASE_URL, MODEL_NAME]):
+if not AI_API_READY:
     print("警告：未在 .env 文件中完整设置 OPENAI_BASE_URL 和 OPENAI_MODEL_NAME。AI相关功能可能无法使用。")
-    client = None
-else:
-    try:
-        if PROXY_URL:
-            print(f"正在为AI请求使用HTTP/S代理: {PROXY_URL}")
-            # httpx 会自动从环境变量中读取代理设置
-            os.environ['HTTP_PROXY'] = PROXY_URL
-            os.environ['HTTPS_PROXY'] = PROXY_URL
-
-        # openai 客户端内部的 httpx 会自动从环境变量中获取代理配置
-        client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL)
-    except Exception as e:
-        print(f"初始化 OpenAI 客户端时出错: {e}")
-        client = None
-
-# 检查AI客户端是否成功初始化
-if not client:
-    # 在 prompt_generator.py 中，如果 client 为 None，会直接报错退出
-    # 在 spider_v2.py 中，AI分析会跳过
-    # 为了保持一致性，这里只打印警告，具体逻辑由调用方处理
-    pass
 
 # 检查关键配置
 if not all([BASE_URL, MODEL_NAME]) and 'prompt_generator.py' in sys.argv[0]:
@@ -88,13 +70,38 @@ if not all([BASE_URL, MODEL_NAME]) and 'prompt_generator.py' in sys.argv[0]:
 
 def get_ai_request_params(**kwargs):
     """
-    构建AI请求参数，根据ENABLE_THINKING和ENABLE_RESPONSE_FORMAT环境变量决定是否添加相应参数
+    构建AI请求参数，根据ENABLE_THINKING和ENABLE_RESPONSE_FORMAT环境变量决定是否添加相应参数。
+    原生 HTTP 调用时，将 thinking 参数直接写入 payload。
     """
     if ENABLE_THINKING:
-        kwargs["extra_body"] = {"enable_thinking": False}
+        kwargs["enable_thinking"] = False
     
     # 如果禁用response_format，则移除该参数
     if not ENABLE_RESPONSE_FORMAT and "response_format" in kwargs:
         del kwargs["response_format"]
     
     return kwargs
+
+
+async def ai_chat_completions(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """使用原生 HTTP 请求调用兼容 OpenAI 的 /chat/completions 接口。"""
+    if not AI_API_READY:
+        raise RuntimeError("AI API 配置不完整")
+
+    url = f"{BASE_URL.rstrip('/')}/chat/completions"
+    headers: Dict[str, str] = {
+        "Content-Type": "application/json",
+    }
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
+
+    proxy = (PROXY_URL or "").strip() or None
+    async with httpx.AsyncClient(
+        timeout=60.0,
+        proxy=proxy,
+        trust_env=False,
+        http2=False,
+    ) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        return resp.json()

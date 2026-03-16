@@ -15,6 +15,16 @@
     "free_shipping": true,
     "new_publish_option": "14天内",
     "region": "江苏/南京/全南京",
+    "hooks": {
+      "before_seller_profile": [
+        "src.hooks.item_hooks:ai_gate_before_seller_profile"
+      ]
+    },
+    "hook_params": {
+      "pre_seller_ai_prompt_file": "prompts/pre_seller_gate_prompt.txt",
+      "pre_seller_ai_fail_open": true,
+      "pre_seller_ai_default_action": "skip_item"
+    },
     "is_running": false
   }
 ]

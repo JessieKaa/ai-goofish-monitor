@@ -20,6 +20,7 @@ from src.services.process_service import ProcessService
 
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
+AI_DEBUG_MODE = os.getenv("AI_DEBUG_MODE", "false").lower() == "true"
 
 def _reload_env() -> None:
     load_dotenv(dotenv_path=env_manager.env_file, override=True)
@@ -241,45 +242,82 @@ async def test_ai_settings(
 ):
     """测试AI模型设置是否有效"""
     try:
-        from openai import OpenAI
-        import httpx
+        import requests
 
         stored_api_key = env_manager.get_value("OPENAI_API_KEY", "")
         submitted_api_key = settings.get("OPENAI_API_KEY", "")
         api_key = submitted_api_key or stored_api_key
 
-        # 创建OpenAI客户端
-        client_params = {
-            "api_key": api_key,
-            "base_url": settings.get("OPENAI_BASE_URL", ""),
-            "timeout": httpx.Timeout(30.0),
+        stored_base_url = env_manager.get_value("OPENAI_BASE_URL", "")
+        submitted_base_url = settings.get("OPENAI_BASE_URL", "")
+        base_url = (submitted_base_url or stored_base_url).strip().rstrip("/")
+
+        stored_model_name = env_manager.get_value("OPENAI_MODEL_NAME", "")
+        submitted_model_name = settings.get("OPENAI_MODEL_NAME", "")
+        model_name = (submitted_model_name or stored_model_name).strip()
+
+        if not base_url or not model_name:
+            return {
+                "success": False,
+                "message": "AI模型连接测试失败: OPENAI_BASE_URL 或 OPENAI_MODEL_NAME 为空"
+            }
+
+        # 优先使用本次提交代理，其次回退环境变量
+        proxy_url = (settings.get("PROXY_URL", "") or env_manager.get_value("PROXY_URL", "") or "").strip()
+
+        print(f"AI测试 - BASE_URL: {base_url}, MODEL: {model_name}, PROXY_SET: {bool(proxy_url)}")
+
+        test_payload = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": "Hi."}],
+            "max_tokens": 10,
         }
 
-        # 如果有代理设置
-        proxy_url = settings.get("PROXY_URL", "")
-        if proxy_url:
-            client_params["http_client"] = httpx.Client(proxy=proxy_url)
+        try:
+            url = f"{base_url}/chat/completions"
+            headers = {
+                "Content-Type": "application/json",
+            }
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            session = requests.Session()
+            session.trust_env = False
+            proxies = None
+            if proxy_url:
+                proxies = {"http": proxy_url, "https": proxy_url}
+            raw_resp = session.post(url, headers=headers, json=test_payload, timeout=30, proxies=proxies)
+            if raw_resp.status_code == 200:
+                data = raw_resp.json()
+                content = (
+                    data.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "No response")
+                )
+                return {
+                    "success": True,
+                    "message": "AI模型连接测试成功！（原生HTTP）",
+                    "response": content
+                }
 
-        model_name = settings.get("OPENAI_MODEL_NAME", "")
-        print(f"AI测试 - BASE_URL: {client_params['base_url']}, MODEL: {model_name}")
-
-        client = OpenAI(**client_params)
-
-        # 测试连接
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "user", "content": "Hello, this is a test message."}
-            ],
-            max_tokens=10
-        )
-
-        return {
-            "success": True,
-            "message": "AI模型连接测试成功！",
-            "response": response.choices[0].message.content if response.choices else "No response"
-        }
+            body_preview = raw_resp.text[:300]
+            return {
+                "success": False,
+                "message": (
+                    "AI模型连接测试失败: "
+                    f"HTTP状态码: {raw_resp.status_code}, 响应: {body_preview}"
+                ),
+            }
+        except Exception as raw_error:
+            return {
+                "success": False,
+                "message": (
+                    "AI模型连接测试失败: "
+                    f"原生HTTP报错: {str(raw_error)}"
+                ),
+            }
     except Exception as e:
+        if AI_DEBUG_MODE:
+            print(f"AI测试 - ERROR: {e}")
         return {
             "success": False,
             "message": f"AI模型连接测试失败: {str(e)}"
